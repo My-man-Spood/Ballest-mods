@@ -1,0 +1,57 @@
+{
+  "title": "BallestSpeedDecimal: how the mod works",
+  "description": "An onboarding tour of this UE4SS Lua mod for Ballest of Them All. Covers what it does, how it's structured, and the two non-obvious lessons baked into the code (a GC/world-leak crash fix, and a widget-reuse rendering bug) that you'd otherwise rediscover the hard way.",
+  "steps": [
+    {
+      "description": "### What this mod does\n\nThree things, layered on top of the native HUD:\n\n1. **A decimal speed readout.** The native speedometer only shows a two-digit integer (`Speed_Left`/`Speed_Right`). We add our own small widget next to it showing the decimal remainder, e.g. `.6`.\n2. **A one-time nudge** of the native digits to the left, to make room for our widget.\n3. **Jump/impact animations** on our widget that mirror the native HUD's own scale-pop and shake, so it doesn't look visually out of place.\n\nThe whole file is one `Scripts/main.lua`, organized top-to-bottom as: logging → configuration → our widget → native-HUD nudge → animation → the main loop that drives all of it. That's the order this tour follows."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 24,
+      "description": "### Configuration lives in one place\n\nEverything tunable is declared up front as named constants — positioning, timing, the GC flags, the magnitude thresholds for collision intensity. If you're adjusting *how it looks or feels* (not *how it works*), this is almost always the only section you need to touch.\n\n`ENABLED` is a kill switch: flip it to `false` and the whole mod goes dormant without unloading."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "selection": { "start": { "line": 70, "character": 1 }, "end": { "line": 81, "character": 4 } },
+      "description": "### Lesson #1: why the overlay's Outer is GameInstance, not World\n\nThis is the one comment in the file you should not \"simplify away.\" Our widget is a real `UObject` we construct via `StaticConstructObject` ([#4]), and every UObject has an `Outer` — the object that owns it.\n\nWe deliberately parent it to `GameInstance` (survives the whole play session) instead of the current race's `World` (dies every time you exit a track). Getting this wrong doesn't error immediately — it crashes the game later, on track exit, with Unreal's own `ReferenceChainSearch` fatal (`\"world leaks\"`). That's because a GC-rooted object (next step) whose `Outer` belongs to a dying `World`, while still reachable from the persistent viewport, is exactly what that assertion exists to catch.\n\nThis was the hardest bug in this mod's history to track down, because the crash happens well after the actual mistake."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 86,
+      "description": "### Building the widget tree by hand\n\n`BuildOverlayWidget` constructs a `UserWidget` → `WidgetTree` → `CanvasPanel` (root) → `TextBlock` (child), entirely from scratch via `StaticConstructObject` — there's no Blueprint asset backing this widget, it's built purely through reflection.\n\n`KEEP_ALIVE_OBJECT_FLAGS` (0x0E000000) is passed to every one of those constructions — it force-keeps the object alive across normal garbage collection. Combined with the `Outer` choice from the previous step, this is the other half of avoiding the world-leak crash: an object that's *both* kept alive by GC flags *and* still rooted in a dying World is the failure mode; we solve it by making sure it's never rooted in the World to begin with."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 417,
+      "description": "### Lesson #2: why the widget is rebuilt every race instead of reused\n\n`HandleEnteringRace` calls `DestroyOverlay()` the moment a new race starts, forcing `CreateOverlay()` to build a brand-new widget on the next tick rather than reusing the previous one.\n\nThe reason is empirical, not theoretical: a reused widget stayed *logically* correct across races — right position, right opacity, attached to the viewport, right Z-order, all confirmed via Lua-side property checks — but was genuinely invisible on screen from race 2 onward. Nothing queryable from Lua explained it; it's presumed to be a render-context/swapchain staleness issue under Wine/DXVK. Destroying and reconstructing fresh every race sidesteps it entirely, so that's the rule: never keep this widget alive across a race boundary."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 187,
+      "description": "### Housekeeping: `SweepOrphanedOverlaysOnce`\n\nSeparate from the per-race rebuild above — this runs exactly once, right after the mod loads (not once per race), and cleans up a widget that might be left over from a *previous Lua hot-reload* of this same mod, which `AddToViewport` would otherwise leave dangling. It's pure hygiene; if you're reading this file for the first time, you can mostly skip past it."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 217,
+      "description": "### The actual speed math\n\nThe native HUD displays `floor(rawVelocity / 50)` as its two-digit integer (reverse-engineered, not documented anywhere). `ComputeDisplaySpeed` reproduces that same division so our decimal lines up with their integer; `FormatDecimalPart` then just peels off the digit after the decimal point."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 240,
+      "description": "### Finding the *live* native HUD, not a decoy\n\n`FindLiveRaceHud` looks more defensive than you'd expect for a simple lookup, for a concrete reason: naively using `FindFirstOf(\"WBP_PlayerUI_C\")` returns whichever matching instance happens to be first in the engine's object array — which turned out to be a **preview copy embedded in the track editor's own UI**, not the in-race HUD at all.\n\nThe fix has two layers: filter candidates by `GetFullName()` containing `\"RaceUIManager\"` (narrows to real gameplay instances), *and* additionally require a valid `.Speed_Right` on the candidate, because more than one `RaceUIManager`-pathed instance can exist simultaneously (a stale leftover alongside the live one). Name-matching alone isn't enough to tell them apart."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 310,
+      "description": "### One native event, two unrelated magnitude scales\n\n`Event_Collision(Magnitude)` on the native HUD fires for *both* hard landings and wall bumps — but logging real values revealed they're reported on completely different scales: landings are raw numbers in the hundreds to low thousands, wall bumps are a normalized value roughly 0 to 1 (occasionally exactly `1.0`).\n\n`CollisionIntensity` picks which calibration to apply based on `MAGNITUDE_SCALE_BOUNDARY`, then maps either scale into the same 0..1 intensity range. Without this split, one fixed threshold either missed every wall bump (too high) or over-triggered on landings (too low) — this was found by logging magnitude values *before* any threshold check, not by guessing at the right number."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 450,
+      "description": "### The main loop: `Tick`, driven by pure polling\n\nEverything above is orchestrated from here, once every `TICK_INTERVAL_MS` (33ms) via `LoopAsync`. Reading top to bottom, `Tick` mirrors the structure of this whole file: sweep orphans, determine race state, handle the race-entry/race-exit transitions, then (while racing) update the native shift, install the animation hooks once, advance any in-progress pulse, and refresh the overlay's text and position.\n\nOne deliberate choice here: this is **pure polling**, not event-driven. An earlier version hooked `PlayerController:ClientRestart` to detect race starts — architecturally nicer, and the same pattern the game's own bundled mods use safely — but it produced a crash on every test, even when the hook did nothing but set a boolean. Polling turned out to be the one configuration that's been reliably stable, so that's what shipped, even though it's not the \"cleaner\" design on paper."
+    },
+    {
+      "description": "### If you're extending this\n\n- Tuning look/feel (position, size, timing, thresholds) → edit the Configuration section ([#2]) only.\n- Touching the native HUD at all → go through `FindLiveRaceHud` ([#8]), never a raw `FindFirstOf`/`FindAllOf` on `WBP_PlayerUI_C` directly, and remember it's filtered for a reason.\n- Constructing any new UObject that needs to survive across a tick → anchor its `Outer` to `GameInstance`, not `World` ([#3]). This is the rule most likely to bite you if ignored.\n- Caching any native widget reference across races → don't. Rebuild it fresh instead ([#5])."
+    }
+  ]
+}

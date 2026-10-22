@@ -1,0 +1,50 @@
+{
+  "title": "The \"world leak\" crash: what we know and what we tried",
+  "description": "A UE4SS Lua mod for Ballest of Them All. This tour explains why reading/touching the native speedometer widget crashes the game on track exit, backed by the actual Unreal crash report, and what's been ruled out.",
+  "steps": [
+    {
+      "description": "### What this mod does\n\nTwo independent parts:\n\n1. **Our own decimal speed readout** — a brand-new widget we construct from scratch and add to the viewport, showing `.X` next to the native two-digit speedometer. This part has **never crashed**, in any configuration we've tried.\n2. **Shifting the native speedometer left** to make room for part 1 — this means reaching into the game's *own* `WBP_PlayerUI` widget and reading/writing its layout. This part crashes the game on track exit, consistently, no matter which technique we use to reach it.\n\nThis tour walks through both, in that order, then the crash evidence itself."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 19,
+      "description": "### Formula + lifecycle overview\n\nThe displayed integer speed is `floor(raw velocity / 50)`. We show the decimal remainder as our own `.X` label.\n\nThe comment here already encodes an earlier lesson: our overlay must never survive a level transition while still referencing the *old* level, and must be destroyed/recreated carefully. That discipline is what keeps part 1 (our own widget) safe — and, as this tour will show, isn't enough on its own to make part 2 (touching the native widget) safe."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 313,
+      "description": "### The part that's never crashed: `CreateOverlay`\n\nThis constructs a **brand-new** `UserWidget` + `CanvasPanel` + `TextBlock` tree via `StaticConstructObject`, with explicit GC-keep flags (`0x0E000000`, [#5] below is a reminder it's *not* about caching). It never calls `FindAllOf` or touches any object the *game* created — everything here is ours, from scratch.\n\nThis is the control group: across every test configuration, this part alone was always stable through track exits. That's the strongest clue that the crash is specifically about touching **pre-existing** native objects, not about widgets or GC flags in general."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 101,
+      "description": "### The cleanest isolation: `InspectNativeSlotsOnce` (read-only)\n\nThis function does nothing but *read* — it walks up the native widget's parent chain (`GetParent()`) and logs each ancestor's class and Slot properties. No writes anywhere.\n\nWe tested this **alone**, with every other native-touching feature disabled. It still crashed the game on track exit (and separately, once, left the game unresponsive to keyboard input). That ruled out \"only writes are risky\" — merely *reading* the native widget tree through UE4SS's reflection is enough."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 62,
+      "description": "### Acquisition attempt #2: hook-parameter capture\n\nThe *first* way we reached the native widget was `FindAllOf(\"TextBlock\")`, scanning every loaded TextBlock for one named `Speed_Right`. That crashed on exit too (that code no longer exists in this file — it's been replaced by what you're looking at now).\n\nThis is a **structurally different** acquisition path: instead of enumerating objects, we hook `Get_Speed_Right_Text` / `Get Speed Left Text` (native functions UE calls constantly to refresh the HUD) and capture `self` — the live `WBP_PlayerUI_C` instance — from inside the hook's own parameter via `Context:get()`. This piggybacks on the engine's own call, rather than UE4SS's object-enumeration cache.\n\nResult: **identical crash.** Same `ReferenceChainSearch` fatal, same moment (track exit). Two independently-built acquisition mechanisms, same outcome — that's strong evidence this isn't about *how* we find the object."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 82,
+      "description": "### Reading the child widget\n\nOnce we have `livePlayerUI`, we read `.Speed_Right` / `.Speed_Left` directly — these are ambiguous property names on the native class (there's *also* an unrelated `FText` field with the same name). Reading is fine; **writing** to this exact property is what caused a *different*, earlier crash (a type-confused write landing on the wrong field).\n\nThat earlier crash is fixed — this tour is about the *second* crash, which happens even though this code only reads."
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 179,
+      "description": "### The actual mutation: `ShiftNativeDigitsLeftOnce`\n\nThis is the one place that **writes** to the native widget: `Slot:SetPadding(...)` on the `HorizontalBox`'s `OverlaySlot`, pushing the digit group left.\n\nImportant: [#4](InspectNativeSlotsOnce) crashed with **zero** calls to `SetPadding` anywhere. So this write isn't *necessary* to trigger the crash — it's sufficient on its own (confirmed independently), but so is pure reading. That rules out \"it's specifically about writing.\""
+    },
+    {
+      "file": "Scripts/main.lua",
+      "line": 420,
+      "description": "### The fix that didn't work\n\nWhen we detect we've left gameplay, we drop our held reference (`livePlayerUI = nil`) and force Lua to actually finalize it (`collectgarbage(\"collect\")`) — not just make it eligible for later collection, but collect it *now*, before the level-teardown's leak check can run.\n\nStill crashed, with the identical error. Combined with [#5](two different acquisition methods, both failing) and [#4](pure reads failing), the evidence points at something UE4SS itself holds onto internally once it has ever wrapped a given native object for Lua — not at anything our script controls or can release."
+    },
+    {
+      "description": "### The actual crash, from Unreal's own crash reporter\n\nNot a guess — this is the literal `ErrorMessage` field from `CrashContext.runtime-xml`, written by the game's own `CrashReportClient` (found at `Saved/Crashes/<GUID>/` in the Proton prefix):\n\n```\nLowLevelFatalError [File:...ReferenceChainSearch.cpp] [Line: 2061]\nCrashing due to uobject leaks (world leaks). See log above for details.\n```\n\nThis is Unreal's **own, intentional** anti-leak assertion — it runs specifically during level/world teardown, and fatals on purpose if it finds something still referencing an object that should have died with the old level. It's not memory corruption, not a race condition in our code, and not random: every single failing test produced this *exact* message, every time, across multiple different techniques for reaching the native widget. The one thing every failing test has in common is touching a **pre-existing** object UE4SS didn't create and doesn't fully control the lifetime of; the one thing that's always been safe is constructing **our own** objects from scratch."
+    },
+    {
+      "description": "### Where this leaves us\n\nRuled out, with actual evidence (not just theory):\n\n- Write vs. read-only — both crash identically\n- Caching duration (long-lived cache vs. drop-and-GC-immediately) — both crash identically\n- Acquisition mechanism (`FindAllOf` enumeration vs. hook-parameter capture) — both crash identically\n\n**Still untested:** whether merely *holding* a reference to the top-level `WBP_PlayerUI_C` instance (via the hook) is enough on its own, without ever reading `.Speed_Right`/`.Speed_Left` or touching the Slot chain at all. If that alone still crashes, it would mean holding *any* reference to this specific per-race widget is unsafe — not just its children. That's the next clean experiment, if we keep going down this path."
+    }
+  ]
+}
